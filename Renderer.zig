@@ -22,7 +22,7 @@ const WorldCoord = @import("math/types.zig").WorldCoord;
 const ChunkCoord = @import("math/types.zig").ChunkCoord;
 
 const FramebufferConfig = @import("EngineConfig.zig").EngineConfig.FramebufferConfig;
-pub const cube_count = 10000; // FIX: Change this shit
+const CameraConfig = @import("EngineConfig.zig").EngineConfig.CameraConfig;
 
 const AtomicUsize = std.atomic.Value(usize);
 
@@ -75,14 +75,25 @@ pub const Renderer = struct {
     tile_offsets: []usize,
     write_pos: []usize, // Per tile write cursor
     tile_refs: []Uint, // FIX: CHANGE TO USIZE, IAM GETTING TIRED OF BEING DUMB
+    chunk_entries: std.ArrayList(ChunkRenderEntry),
 
-    pub fn init(allocator: std.mem.Allocator, conf: FramebufferConfig, tile_counts: usize) !Renderer {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        conf: FramebufferConfig,
+        tile_counts: usize,
+        view_distance: f32,
+    ) !Renderer {
+        const side: usize = @intFromFloat(view_distance * 2 + 1);
+        std.debug.print("side: {any}", .{side});
+
+        const estimated: usize = side * side * side; // AABB of the view sphere
+
         return .{
-            .triangles = try allocator.alloc(
-                RasterTriangle,
-                20 * 16 * 16 * 16 * 12, // 20 chunks
-            ), // FIX: Change me
-            .cubes_triangles_count = try allocator.alloc(usize, cube_count),
+            // FIX: For now I consider pseudo AABB of the view sphere,
+            // but later please implement alloc for the view sphere
+            // Remove magic numbers here before I have a big issueMQLSJDLKJSDF KJSF
+            .triangles = try allocator.alloc(RasterTriangle, estimated * 16 * 16 * 16 * 12),
+            .cubes_triangles_count = try allocator.alloc(usize, estimated * 16 * 16 * 16),
 
             .width = conf.width,
             .height = conf.height,
@@ -91,6 +102,7 @@ pub const Renderer = struct {
             .tile_offsets = try allocator.alloc(usize, tile_counts + 1),
             .write_pos = try allocator.alloc(usize, tile_counts),
             .tile_refs = try allocator.alloc(Uint, 1000000), // Initial guess
+            .chunk_entries = try std.ArrayList(ChunkRenderEntry).initCapacity(allocator, estimated),
         };
     }
 
@@ -100,6 +112,7 @@ pub const Renderer = struct {
         allocator.free(self.write_pos);
         allocator.free(self.tile_refs);
         allocator.free(self.cubes_triangles_count);
+        self.chunk_entries.deinit(allocator);
     }
 
     pub fn begin_frame(self: *Renderer, allocator: std.mem.Allocator) !void {
@@ -300,23 +313,6 @@ pub const Renderer = struct {
         };
     }
 
-    pub fn renderChunk(self: *Renderer, allocator: std.mem.Allocator, chunk: *Chunk, camera: *Camera, atlas: *Atlas, pool: std.Thread.Pool) !void {
-        var cube_grass = Cube.init(.grass);
-        // const cube_dirt = Cube.init(.dirt);
-        // const cube_stone = Cube.init(.stone);
-        _ = pool;
-        _ = allocator;
-
-        for (0..chunk.voxels.len) |i| {
-            const x: Float = @floatFromInt(i / (chunk.dimensions * chunk.dimensions) * 2);
-            const y: Float = @floatFromInt(((i / chunk.dimensions) % chunk.dimensions) * 2);
-            const z: Float = @floatFromInt((i % chunk.dimensions) * 2);
-
-            // For now we render everything as grass blocks
-            self.cubes_triangles_count[i] = cube_grass.genRasterTriangles(self, camera, atlas, self.triangles[i * 12 .. i * 12 + 12], .{ x, y, z, 0 });
-        }
-    }
-
     ////////////////////////////////////////////////////////////////////////////
 
     fn worldToChunkCoord(coord: WorldCoord, chunk_size: i32) ChunkCoord {
@@ -331,10 +327,13 @@ pub const Renderer = struct {
         };
     }
 
-    /// Returns the avg of the two AABB points
-    fn chunkCenter(chunk: *const Chunk) @Vector(3, f32) {
+    /// Returns the avg of the two AABB points aka. chunk center
+    pub fn chunkCenter(chunk: *const Chunk) @Vector(3, f32) {
         const half_vec = @as(@Vector(3, f32), @splat(0.5));
-        return (chunk.world_min + chunk.world_max) * half_vec;
+        const world_min: @Vector(3, f32) = @floatFromInt(chunk.world_min);
+        const world_max: @Vector(3, f32) = @floatFromInt(chunk.world_max);
+
+        return (world_min + world_max) * half_vec;
     }
 
     fn dist2ToPlayer(player: WorldCoord, chunk: *const Chunk) f32 {
@@ -350,21 +349,16 @@ pub const Renderer = struct {
 
     pub fn renderWorld(
         self: *Renderer,
-        allocator: std.mem.Allocator,
         player_pos: WorldCoord,
-        view_distance: Float, // should not be a float
+        view_distance: i32,
+        chunk_size: usize,
         world: *World,
+        camera: *Camera,
+        atlas: *Atlas,
     ) !void {
-        _ = self;
         const player_chunk = worldToChunkCoord(player_pos, 16); // FIX: Change magic number
 
-        const side: usize = @intCast(view_distance * 2 + 1); // understand this
-        const estimated: usize = side * side * side;
-        var entries = try std.ArrayList(ChunkRenderEntry).initCapacity(
-            allocator,
-            estimated,
-        );
-        defer entries.deinit(allocator);
+        self.chunk_entries.clearRetainingCapacity();
 
         // For a render radius R = view_distance, gather chunk coords around the player
         var cz = player_chunk[2] - view_distance;
@@ -378,23 +372,42 @@ pub const Renderer = struct {
                     if (world.getChunk(coord)) |chunk| {
                         // TODO: Frustum cull here first
 
-                        try entries.append(.{
-                            .chunk = chunk,
-                            .dist2 = dist2ToPlayer(player_pos, chunk),
-                        });
+                        try self.chunk_entries.appendBounded(
+                            .{
+                                .chunk = chunk,
+                                .dist2 = dist2ToPlayer(player_pos, chunk),
+                            },
+                        );
                     }
                 }
             }
         }
 
-        std.sort.block(ChunkRenderEntry, entries.items, {}, struct {
+        // Front to back rendering
+        std.sort.block(ChunkRenderEntry, self.chunk_entries.items, {}, struct {
             fn lessThan(_: void, a: ChunkRenderEntry, b: ChunkRenderEntry) bool {
                 return a.dist2 < b.dist2;
             }
         }.lessThan);
 
-        // for (entries.items) |entry| {
-        //     renderChunk(self: *Renderer, allocator: Allocator, chunk: *Chunk, camera: *Camera, atlas: *Atlas, pool: Pool)
-        // }
+        for (self.chunk_entries.items, 0..) |chunk, chunk_i| {
+            const cubes_per_chunk = chunk_size * chunk_size * chunk_size;
+            const chunk_offset = chunk_i * cubes_per_chunk;
+
+            // Then we render the chunk
+            for (0..chunk.chunk.voxels.len) |i| {
+                var cube_grass = Cube.init(.grass); // for now we render everything as a grass block
+
+                // This is working for sure
+                const x: Float = @floatFromInt(i / (chunk_size * chunk_size) * 2);
+                const y: Float = @floatFromInt(((i / chunk_size) % chunk_size) * 2);
+                const z: Float = @floatFromInt((i % chunk_size) * 2);
+
+                const cube_start = chunk_offset * 12 + i * 12;
+                const cube_end = cube_start + 12;
+                self.cubes_triangles_count[chunk_offset + i] =
+                    cube_grass.genRasterTriangles(self, camera, atlas, self.triangles[cube_start..cube_end], .{ x, y, z, 0 });
+            }
+        }
     }
 };
